@@ -1,0 +1,160 @@
+name: Vigilancia de upstream (RP2350)
+
+# Cada 2 h mira si richonguzman/LoRa_APRS_iGate ha movido su main. Solo si lo ha
+# movido, compila su main con nuestro port RP2350 y una placa ESP32:
+#   - mientras la #438 no este fusionada, fusiona aqui nuestra rama rp2350-port
+#     (en el runner, sin subir nada): un conflicto tambien es un fallo;
+#   - cuando ya este fusionada (existe src/rp2350/), compila su main tal cual.
+# Si algo falla, la ejecucion sale en rojo y GitHub avisa por email.
+# El ultimo commit comprobado queda en vigilancia/ultimo.txt de esta rama, para no
+# compilar ni avisar dos veces por el mismo push.
+#
+# Esta rama (vigilancia) es la rama por defecto del fork porque GitHub solo ejecuta
+# los workflows programados desde la rama por defecto. main sigue siendo copia de
+# la suya. Antes de tocar este fichero: git pull (el bot commitea ultimo.txt).
+
+on:
+  schedule:
+    - cron: "23 */2 * * *"          # cada 2 h, en el minuto 23 (fuera del pico de :00)
+  workflow_dispatch:
+    inputs:
+      forzar:
+        description: "Compilar aunque su main no haya cambiado"
+        type: boolean
+        default: false
+      simular_fallo:
+        description: "Fallar a proposito, para probar el email (no guarda estado)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: vigilancia
+  cancel-in-progress: false
+
+permissions:
+  contents: write                   # solo para commitear vigilancia/ultimo.txt
+
+env:
+  UPSTREAM: https://github.com/richonguzman/LoRa_APRS_iGate.git
+  PORT_BRANCH: rp2350-port
+  ENVS: pico2_w5500_e22 wiznet_5500_evb_pico2_e22p wiznet_5100s_evb_pico2_e22p ttgo-lora32-v21
+
+jobs:
+  vigilar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Esta rama (estado)
+        uses: actions/checkout@v7
+        with:
+          path: estado
+
+      - name: Ha cambiado su main?
+        id: cambio
+        env:
+          FORZAR: ${{ inputs.forzar }}
+          SIMULAR: ${{ inputs.simular_fallo }}
+        run: |
+          sha=$(git ls-remote "$UPSTREAM" refs/heads/main | cut -f1)
+          [ -n "$sha" ] || { echo "::error::no se pudo leer su main"; exit 1; }
+          ultimo=$(cut -d' ' -f1 estado/vigilancia/ultimo.txt 2>/dev/null || true)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ "$sha" = "$ultimo" ] && [ "$FORZAR" != "true" ] && [ "$SIMULAR" != "true" ]; then
+            echo "seguir=no" >> "$GITHUB_OUTPUT"
+            echo "Su main sigue en \`${sha:0:7}\`, ya comprobado: nada que hacer." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "seguir=si" >> "$GITHUB_OUTPUT"
+            echo "### Su main: \`${sha:0:7}\` (antes: \`${ultimo:0:7}\`)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Fallo simulado
+        if: inputs.simular_fallo
+        run: |
+          echo "Fallo simulado para probar el aviso por email." >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Vigilancia::fallo simulado (prueba del email)"
+          exit 1
+
+      - name: Su main
+        if: steps.cambio.outputs.seguir == 'si'
+        uses: actions/checkout@v7
+        with:
+          repository: richonguzman/LoRa_APRS_iGate
+          ref: ${{ steps.cambio.outputs.sha }}
+          fetch-depth: 0
+          path: igate
+
+      - name: Fusionar el port (si aun no esta en su main)
+        if: steps.cambio.outputs.seguir == 'si'
+        working-directory: igate
+        run: |
+          if [ -d src/rp2350 ]; then
+            echo "El port ya esta en su main: se compila tal cual." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name vigilancia
+          git config user.email vigilancia@localhost
+          git fetch --no-tags "https://github.com/${{ github.repository }}.git" "$PORT_BRANCH"
+          port=$(git rev-parse --short FETCH_HEAD)
+          if git merge --no-edit FETCH_HEAD > ../merge.log 2>&1; then
+            echo "Fusionado \`$PORT_BRANCH\` (\`$port\`) sin conflictos." >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "**CONFLICTO** al fusionar \`$PORT_BRANCH\` (\`$port\`) con su main. Ficheros:"
+              echo '```'
+              git diff --name-only --diff-filter=U
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Vigilancia::conflicto al fusionar $PORT_BRANCH con su main"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v7
+        if: steps.cambio.outputs.seguir == 'si'
+        with:
+          python-version: "3.13"
+
+      - name: Instalar PlatformIO
+        if: steps.cambio.outputs.seguir == 'si'
+        run: pip install --upgrade platformio
+
+      - name: Compilar
+        if: steps.cambio.outputs.seguir == 'si'
+        working-directory: igate
+        run: |
+          echo "| Env | Resultado |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          fallos=""
+          for e in $ENVS; do
+            if pio run -e "$e" > "../$e.log" 2>&1; then
+              echo "| \`$e\` | OK |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              fallos="$fallos $e"
+              echo "| \`$e\` | **NO COMPILA** |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error title=$e::no compila"
+            fi
+          done
+          for e in $fallos; do
+            {
+              echo
+              echo "#### $e (ultimas 40 lineas)"
+              echo '```'
+              tail -n 40 "../$e.log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+          [ -z "$fallos" ]
+
+      - name: Guardar el commit comprobado
+        if: (success() || failure()) && steps.cambio.outputs.seguir == 'si' && !inputs.simular_fallo
+        working-directory: estado
+        env:
+          SHA: ${{ steps.cambio.outputs.sha }}
+          RESULTADO: ${{ job.status }}
+        run: |
+          mkdir -p vigilancia
+          echo "$SHA $RESULTADO $(date -u +%Y-%m-%dT%H:%MZ)" > vigilancia/ultimo.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add vigilancia/ultimo.txt
+          git commit -q -m "vigilancia: ${SHA:0:7} $RESULTADO"
+          git pull -q --rebase && git push -q
