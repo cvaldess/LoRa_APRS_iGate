@@ -48,6 +48,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           path: estado
+          fetch-depth: 0                # un push desde un clon superficial dio Internal Server Error
 
       - name: Ha cambiado su main?
         id: cambio
@@ -144,8 +145,11 @@ jobs:
           done
           [ -z "$fallos" ]
 
+      # Si no se puede guardar, solo un aviso: la compilacion ya dijo lo que importa
+      # y la siguiente pasada vuelve a comprobar el mismo commit.
       - name: Guardar el commit comprobado
         if: (success() || failure()) && steps.cambio.outputs.seguir == 'si' && !inputs.simular_fallo
+        continue-on-error: true
         working-directory: estado
         env:
           SHA: ${{ steps.cambio.outputs.sha }}
@@ -157,4 +161,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add vigilancia/ultimo.txt
           git commit -q -m "vigilancia: ${SHA:0:7} $RESULTADO"
-          git pull -q --rebase && git push -q
+          for intento in 1 2 3; do
+            git pull -q --rebase && git push -q && exit 0
+            sleep 15
+          done
+          echo "::warning title=Vigilancia::no se pudo guardar ultimo.txt; la siguiente pasada volvera a compilar ${SHA:0:7}"
+          exit 1
